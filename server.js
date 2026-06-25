@@ -100,13 +100,16 @@ wss.on('connection', ws => {
       room.clients.set(clientId, ws);
       currentRoom = roomId;
 
+      // Текущий статус хоста — гость сразу откроет то же аниме
+      const hostStatus = room.statuses.get(room.hostId) || null;
       ws.send(JSON.stringify({
-        type:    'room_joined',
+        type:       'room_joined',
         roomId,
         clientId,
-        role:    clientId === room.hostId ? 'host' : 'guest',
-        chat:    room.chat,
-        members: memberList(room),
+        role:       clientId === room.hostId ? 'host' : 'guest',
+        chat:       room.chat,
+        members:    memberList(room),
+        hostStatus: hostStatus,
       }));
 
       // Оповестить всех об обновлении участников
@@ -121,11 +124,12 @@ wss.on('connection', ws => {
     if (!room) return;
 
     // ── STATUS UPDATE: каждый участник шлёт СВОЙ статус просмотра ──
-    // (серия/озвучка/плеер/время/пауза/название аниме). Никаких
+    // (серия/озвучка/плеер/время/пауза/название аниме/slug аниме). Никаких
     // ограничений на роль — гость и хост абсолютно равноправны.
     if (msg.type === 'status_update') {
       const status = {
         animeTitle:  msg.status && msg.status.animeTitle  != null ? String(msg.status.animeTitle).slice(0, 200) : null,
+        animeSlug:   msg.status && msg.status.animeSlug   != null ? String(msg.status.animeSlug).slice(0, 500)  : null,
         episode:     msg.status && msg.status.episode     != null ? String(msg.status.episode).slice(0, 20)   : null,
         dubbing:     msg.status && msg.status.dubbing     != null ? String(msg.status.dubbing).slice(0, 100)  : null,
         player:      msg.status && msg.status.player      != null ? String(msg.status.player).slice(0, 100)   : null,
