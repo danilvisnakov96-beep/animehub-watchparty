@@ -47,6 +47,12 @@ wss.on('connection', ws => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
+    // ── PING (heartbeat) ───────────────────────────────────
+    if (msg.type === 'ping') {
+      ws.send(JSON.stringify({ type: 'pong' }));
+      return;
+    }
+
     // ── CREATE ROOM ────────────────────────────────────
     if (msg.type === 'create_room') {
       const roomId = uuidv4().slice(0, 8).toUpperCase();
@@ -100,6 +106,23 @@ wss.on('connection', ws => {
       if (clientId !== room.hostId) return; // гость не может управлять
       room.state = { ...room.state, ...msg.state };
       broadcast(currentRoom, { type: 'player_sync', state: room.state }, clientId);
+      return;
+    }
+
+    // ── PLAYER CONTROL: play / pause / seek (только хост) ──
+    if (msg.type === 'player_control') {
+      if (clientId !== room.hostId) return;
+      // Обновляем кешированное время (для гостей, которые подключатся позже)
+      if (msg.action === 'seek' && msg.time != null) {
+        room.state = { ...room.state, currentTime: msg.time, paused: room.state.paused };
+      }
+      if (msg.action === 'pause') {
+        room.state = { ...room.state, paused: true };
+      }
+      if (msg.action === 'play') {
+        room.state = { ...room.state, paused: false };
+      }
+      broadcast(currentRoom, { type: 'player_control', action: msg.action, time: msg.time }, clientId);
       return;
     }
 
