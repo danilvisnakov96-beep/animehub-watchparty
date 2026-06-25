@@ -3,20 +3,34 @@ const { v4: uuidv4 }      = require('uuid');
 
 const PORT = process.env.PORT || 8080;
 
-// rooms: Map<roomId, { hostId, clients: Map<clientId, ws>, chat: [], state: {} }>
+/* ====================================================
+   AnimeHub WatchParty — server.js
+
+   НОВАЯ МОДЕЛЬ (без принудительной синхронизации плеера):
+   - Каждый участник (хост и гости) смотрит и управляет своим
+     собственным плеером полностью самостоятельно — выбирает
+     серию/озвучку/плеер/перемотку сам, без ограничений.
+   - Участники периодически шлют на сервер свой личный статус
+     просмотра ({episode, dubbing, player, currentTime, paused,
+     animeTitle}) — сервер просто ретранслирует его остальным,
+     чтобы в общем лобби/чате было видно "кто на чём смотрит".
+   - Чат общий для всех, как и раньше.
+   - При выходе хоста комната больше НЕ уничтожается — раз нет
+     принудительного управления, "хост" — это просто создатель
+     комнаты для истории, а не единственный, кто может ей рулить.
+     Комната живёт, пока в ней есть хотя бы один участник.
+   ==================================================== */
+
+// rooms: Map<roomId, { hostId, clients: Map<clientId, ws>, chat: [], statuses: Map<clientId, status> }>
 const rooms = new Map();
 
 const wss = new WebSocketServer({ port: PORT });
 
-// Удалить комнату и оповестить всех
-function destroyRoom(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  broadcast(roomId, { type: 'room_closed' });
-  room.clients.forEach(ws => { try { ws.close(); } catch (_) {} });
-  rooms.delete(roomId);
-  console.log(`[Room ${roomId}] destroyed`);
-}
+// Таймаут неактивности соединения (мс). Если от клиента не было ни
+// одного сообщения (включая ping) дольше этого срока — считаем его
+// мёртвым и закрываем. Защищает от "фантомных" участников в лобби
+// при частых reload/закрытии вкладки без штатного leave_room.
+const IDLE_TIMEOUT_MS = 60000;
 
 // Отправить всем в комнате (кроме sender, если указан)
 function broadcast(roomId, msg, excludeId = null) {
@@ -29,21 +43,28 @@ function broadcast(roomId, msg, excludeId = null) {
   });
 }
 
-// Список участников для отправки
+// Список участников со статусами для отправки клиенту
 function memberList(room) {
-  return [
-    { id: room.hostId, role: 'host' },
-    ...[...room.clients.keys()]
-      .filter(id => id !== room.hostId)
-      .map(id => ({ id, role: 'guest' }))
-  ];
+  return [...room.clients.keys()].map(id => ({
+    id,
+    role:   id === room.hostId ? 'host' : 'guest',
+    status: room.statuses.get(id) || null,
+  }));
 }
 
 wss.on('connection', ws => {
   const clientId = uuidv4();
   let currentRoom = null;
+  let lastActivity = Date.now();
+
+  const idleCheck = setInterval(() => {
+    if (Date.now() - lastActivity > IDLE_TIMEOUT_MS) {
+      try { ws.terminate(); } catch (_) {}
+    }
+  }, 15000);
 
   ws.on('message', raw => {
+    lastActivity = Date.now();
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
@@ -57,10 +78,10 @@ wss.on('connection', ws => {
     if (msg.type === 'create_room') {
       const roomId = uuidv4().slice(0, 8).toUpperCase();
       rooms.set(roomId, {
-        hostId:  clientId,
-        clients: new Map([[clientId, ws]]),
-        chat:    [],
-        state:   { episode: null, dubbing: null, player: null, animeSlug: msg.animeSlug || null }
+        hostId:   clientId,
+        clients:  new Map([[clientId, ws]]),
+        chat:     [],
+        statuses: new Map(),
       });
       currentRoom = roomId;
       ws.send(JSON.stringify({ type: 'room_created', roomId, clientId, role: 'host' }));
@@ -79,29 +100,14 @@ wss.on('connection', ws => {
       room.clients.set(clientId, ws);
       currentRoom = roomId;
 
-      // Отправить присоединившемуся текущее состояние + историю чата
       ws.send(JSON.stringify({
         type:    'room_joined',
         roomId,
         clientId,
-        role:    'guest',
-        state:   room.state,
+        role:    clientId === room.hostId ? 'host' : 'guest',
         chat:    room.chat,
-        members: memberList(room)
+        members: memberList(room),
       }));
-
-      // Если хост уже смотрит — сразу синхронизируем позицию нового гостя
-      if (room.state.currentTime != null) {
-        setTimeout(() => {
-          if (ws.readyState === 1) {
-            ws.send(JSON.stringify({
-              type:   'player_control',
-              action: room.state.paused ? 'pause' : 'time',
-              time:   room.state.currentTime,
-            }));
-          }
-        }, 1500); // небольшая задержка — гость успевает загрузить плеер
-      }
 
       // Оповестить всех об обновлении участников
       broadcast(roomId, { type: 'members_update', members: memberList(room) }, clientId);
@@ -114,24 +120,21 @@ wss.on('connection', ws => {
     const room = rooms.get(currentRoom);
     if (!room) return;
 
-    // ── PLAYER SYNC (только хост) ──────────────────────
-    if (msg.type === 'player_sync') {
-      if (clientId !== room.hostId) return; // гость не может управлять
-      room.state = { ...room.state, ...msg.state };
-      broadcast(currentRoom, { type: 'player_sync', state: room.state }, clientId);
-      return;
-    }
-
-    // ── PLAYER CONTROL: play / pause / seek / time (только хост) ──
-    if (msg.type === 'player_control') {
-      if (clientId !== room.hostId) return;
-      // Кешируем текущее время и статус паузы для новых гостей
-      if ((msg.action === 'time' || msg.action === 'seek') && msg.time != null) {
-        room.state = { ...room.state, currentTime: msg.time };
-      }
-      if (msg.action === 'pause') room.state = { ...room.state, paused: true };
-      if (msg.action === 'play')  room.state = { ...room.state, paused: false };
-      broadcast(currentRoom, { type: 'player_control', action: msg.action, time: msg.time }, clientId);
+    // ── STATUS UPDATE: каждый участник шлёт СВОЙ статус просмотра ──
+    // (серия/озвучка/плеер/время/пауза/название аниме). Никаких
+    // ограничений на роль — гость и хост абсолютно равноправны.
+    if (msg.type === 'status_update') {
+      const status = {
+        animeTitle:  msg.status && msg.status.animeTitle  != null ? String(msg.status.animeTitle).slice(0, 200) : null,
+        episode:     msg.status && msg.status.episode     != null ? String(msg.status.episode).slice(0, 20)   : null,
+        dubbing:     msg.status && msg.status.dubbing     != null ? String(msg.status.dubbing).slice(0, 100)  : null,
+        player:      msg.status && msg.status.player      != null ? String(msg.status.player).slice(0, 100)   : null,
+        currentTime: msg.status && typeof msg.status.currentTime === 'number' ? msg.status.currentTime        : null,
+        paused:      !!(msg.status && msg.status.paused),
+        updatedAt:   Date.now(),
+      };
+      room.statuses.set(clientId, status);
+      broadcast(currentRoom, { type: 'status_update', clientId, status }, clientId);
       return;
     }
 
@@ -154,8 +157,8 @@ wss.on('connection', ws => {
     }
   });
 
-  ws.on('close', () => handleLeave());
-  ws.on('error', () => handleLeave());
+  ws.on('close', () => { clearInterval(idleCheck); handleLeave(); });
+  ws.on('error', () => { clearInterval(idleCheck); handleLeave(); });
 
   function handleLeave() {
     if (!currentRoom) return;
@@ -163,17 +166,17 @@ wss.on('connection', ws => {
     if (!room) { currentRoom = null; return; }
 
     room.clients.delete(clientId);
+    room.statuses.delete(clientId);
     console.log(`[Room ${currentRoom}] ${clientId} left`);
 
-    // Если ушёл хост — уничтожить комнату
-    if (clientId === room.hostId) {
-      destroyRoom(currentRoom);
-    } else if (room.clients.size === 0) {
-      // Все вышли — удалить комнату
+    if (room.clients.size === 0) {
+      // Комната пуста (включая хоста) — удаляем.
       rooms.delete(currentRoom);
       console.log(`[Room ${currentRoom}] empty, deleted`);
     } else {
-      // Уведомить оставшихся
+      // Комната продолжает жить, даже если ушёл хост — управления
+      // плеером больше нет, так что "хост" не более чем создатель
+      // комнаты. Просто уведомляем оставшихся об обновлении списка.
       broadcast(currentRoom, { type: 'members_update', members: memberList(room) });
     }
     currentRoom = null;
