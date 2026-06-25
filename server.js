@@ -90,6 +90,19 @@ wss.on('connection', ws => {
         members: memberList(room)
       }));
 
+      // Если хост уже смотрит — сразу синхронизируем позицию нового гостя
+      if (room.state.currentTime != null) {
+        setTimeout(() => {
+          if (ws.readyState === 1) {
+            ws.send(JSON.stringify({
+              type:   'player_control',
+              action: room.state.paused ? 'pause' : 'time',
+              time:   room.state.currentTime,
+            }));
+          }
+        }, 1500); // небольшая задержка — гость успевает загрузить плеер
+      }
+
       // Оповестить всех об обновлении участников
       broadcast(roomId, { type: 'members_update', members: memberList(room) }, clientId);
       console.log(`[Room ${roomId}] ${clientId} joined`);
@@ -109,19 +122,15 @@ wss.on('connection', ws => {
       return;
     }
 
-    // ── PLAYER CONTROL: play / pause / seek (только хост) ──
+    // ── PLAYER CONTROL: play / pause / seek / time (только хост) ──
     if (msg.type === 'player_control') {
       if (clientId !== room.hostId) return;
-      // Обновляем кешированное время (для гостей, которые подключатся позже)
-      if (msg.action === 'seek' && msg.time != null) {
-        room.state = { ...room.state, currentTime: msg.time, paused: room.state.paused };
+      // Кешируем текущее время и статус паузы для новых гостей
+      if ((msg.action === 'time' || msg.action === 'seek') && msg.time != null) {
+        room.state = { ...room.state, currentTime: msg.time };
       }
-      if (msg.action === 'pause') {
-        room.state = { ...room.state, paused: true };
-      }
-      if (msg.action === 'play') {
-        room.state = { ...room.state, paused: false };
-      }
+      if (msg.action === 'pause') room.state = { ...room.state, paused: true };
+      if (msg.action === 'play')  room.state = { ...room.state, paused: false };
       broadcast(currentRoom, { type: 'player_control', action: msg.action, time: msg.time }, clientId);
       return;
     }
