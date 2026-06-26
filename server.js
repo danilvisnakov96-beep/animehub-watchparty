@@ -154,6 +154,34 @@ wss.on('connection', ws => {
       return;
     }
 
+    // ── SYNC COMMAND: хост рассылает команду play/pause/seek гостям ──
+    // Только хост комнаты может рассылать sync_command.
+    // Сервер просто ретранслирует команду всем остальным участникам.
+    if (msg.type === 'sync_command') {
+      // Проверяем, что отправитель — хост комнаты
+      if (clientId !== room.hostId) return;
+      const command = msg.command;
+      if (!command || !command.action) return;
+      // Валидируем action
+      if (!['play', 'pause', 'seek'].includes(command.action)) return;
+      // Ретранслируем гостям (всем кроме хоста)
+      const payload = JSON.stringify({
+        type: 'sync_command',
+        command: {
+          action: command.action,
+          time:   typeof command.time === 'number' ? command.time : null,
+          paused: !!command.paused,
+          ts:     Date.now(),
+        },
+      });
+      room.clients.forEach((clientWs, id) => {
+        if (id !== clientId && clientWs.readyState === 1) {
+          clientWs.send(payload);
+        }
+      });
+      return;
+    }
+
     // ── LEAVE ROOM ─────────────────────────────────────
     if (msg.type === 'leave_room') {
       handleLeave();
